@@ -1,0 +1,245 @@
+/**
+ * HPM6E8Y - 纯 CSP 模式 (带自动复位/优雅退出功能)
+ * 对应 XML Module: #x219800
+ * 功能更新: 添加 Ctrl+C 信号处理，退出时自动复位从站，无需重新上电。
+ */
+
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/resource.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <math.h>
+#include <sched.h>
+#include "ecrt.h"
+
+/****************************************************************************/
+
+#define TASK_FREQUENCY       1000
+#define PERIOD_NS            (1000000000 / TASK_FREQUENCY)
+#define TIMESPEC2NS(T) ((uint64_t) (T).tv_sec * 1000000000 + (T).tv_nsec)
+
+#define MOVE_STEP            5     
+#define POS_LIMIT            1000000 
+
+#define MODULE_ID_CSP_ONLY   0x219800 
+
+static ec_master_t *master = NULL;
+static ec_domain_t *domain1 = NULL;
+static ec_slave_config_t *sc_hpm = NULL;
+static uint8_t *domain1_pd = NULL;
+
+#define HPM_ALIAS       0, 0
+#define HPM_VID_PID     0x0048504d, 0x00000004
+
+/* --- 新增：运行标志位 --- */
+static volatile int run = 1;
+
+/****************************************************************************/
+
+/* 信号处理函数：捕获 Ctrl+C */
+void signal_handler(int signum) {
+    if (signum == SIGINT || signum == SIGTERM) {
+        printf("\n\nSignal %d received, preparing to stop...\n", signum);
+        run = 0; // 将运行标志置 0，主循环将退出
+    }
+}
+
+/****************************************************************************/
+
+static struct {
+    unsigned int ctrl_word;
+    unsigned int target_pos;
+    
+    unsigned int status_word;
+    unsigned int act_pos;
+} offset;
+
+const static ec_pdo_entry_reg_t domain1_regs[] = {
+    {HPM_ALIAS, HPM_VID_PID, 0x6040, 0, &offset.ctrl_word},
+    {HPM_ALIAS, HPM_VID_PID, 0x607A, 0, &offset.target_pos},
+    {HPM_ALIAS, HPM_VID_PID, 0x6041, 0, &offset.status_word},
+    {HPM_ALIAS, HPM_VID_PID, 0x6064, 0, &offset.act_pos},
+    {}
+};
+
+/**************************************************************************/
+
+static ec_pdo_entry_info_t hpm_pdo_entries_rx[] = {
+    {0x6040, 0x00, 16}, 
+    {0x607A, 0x00, 32}, 
+    {0x0000, 0x00, 16}, 
+};
+
+static ec_pdo_entry_info_t hpm_pdo_entries_tx[] = {
+    {0x6041, 0x00, 16}, 
+    {0x6064, 0x00, 32}, 
+    {0x0000, 0x00, 16}, 
+};
+
+static ec_pdo_info_t hpm_pdos[] = {
+    {0x1601, 3, hpm_pdo_entries_rx}, 
+    {0x1A01, 3, hpm_pdo_entries_tx}  
+};
+
+static ec_sync_info_t hpm_syncs[] = {
+    { 0, EC_DIR_OUTPUT, 0, NULL, EC_WD_DISABLE },
+    { 1, EC_DIR_INPUT, 0, NULL, EC_WD_DISABLE },
+    { 2, EC_DIR_OUTPUT, 1, hpm_pdos + 0, EC_WD_ENABLE },
+    { 3, EC_DIR_INPUT, 1, hpm_pdos + 1, EC_WD_DISABLE },
+    { 0xFF }
+};
+
+/**************************************************************************/
+
+void cyclic_task(struct timespec *wakeup_time)
+{
+    static uint16_t command = 0x0000;
+    static int32_t target_pos = 0;
+    static int initialized = 0;
+    static int direction = 1;
+    static int counter = 0;
+    
+    uint16_t status;
+    int32_t act_pos;
+
+    ecrt_master_application_time(master, TIMESPEC2NS(*wakeup_time));
+    ecrt_master_receive(master);
+    ecrt_domain_process(domain1);
+
+    status = EC_READ_U16(domain1_pd + offset.status_word);
+    act_pos = EC_READ_S32(domain1_pd + offset.act_pos);
+
+    if ((status & 0x006F) == 0x0027) {
+        if (!initialized) {
+            target_pos = act_pos;
+            initialized = 1;
+            printf(">>> Motor Enabled! Locked at: %d <<<\n", target_pos);
+        }
+    } else {
+        initialized = 0;
+    }
+
+    /* CiA 402 状态机 + 故障复位 */
+    if (status & 0x0008) {
+        // --- 自动故障复位逻辑 ---
+        command = 0x0080; // 发送 Fault Reset (Bit 7)
+        printf("Fault detected (0x%04X), attempting reset...\n", status);
+    }
+    else if ((status & 0x004F) == 0x0040) command = 0x0006;
+    else if ((status & 0x006F) == 0x0021) command = 0x0007;
+    else if ((status & 0x006F) == 0x0023) command = 0x000F;
+    else if ((status & 0x006F) == 0x0027) {
+        command = 0x000F; 
+        
+        if (direction == 1) {
+            target_pos += MOVE_STEP;
+            if (target_pos >= POS_LIMIT) direction = -1;
+        } else {
+            target_pos -= MOVE_STEP;
+            if (target_pos <= -POS_LIMIT) direction = 1;
+        }
+    }
+
+    EC_WRITE_U16(domain1_pd + offset.ctrl_word, command);
+    EC_WRITE_S32(domain1_pd + offset.target_pos, target_pos);
+
+    if (counter % 500 == 0) {
+        printf("CSP-Run: Sts=0x%04X | Act=%d | Tgt=%d\n", status, act_pos, target_pos);
+    }
+
+    ecrt_master_sync_reference_clock(master);
+    ecrt_master_sync_slave_clocks(master);
+    ecrt_domain_queue(domain1);
+    ecrt_master_send(master);
+    
+    counter++;
+}
+
+/****************************************************************************/
+
+int main(int argc, char **argv)
+{
+    struct timespec wakeup_time;
+    struct sched_param param;
+
+    /* --- 步骤1: 注册信号处理，捕获 Ctrl+C --- */
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    printf("Starting HPM Pure CSP Control (Auto-Reset Enabled)...\n");
+
+    master = ecrt_request_master(0);
+    if (!master) {
+        fprintf(stderr, "Failed to request master.\n");
+        return -1;
+    }
+
+    domain1 = ecrt_master_create_domain(master);
+    if (!domain1) return -1;
+
+    if (!(sc_hpm = ecrt_master_slave_config(master, HPM_ALIAS, HPM_VID_PID))) {
+        fprintf(stderr, "Failed to get slave config!\n");
+        return -1;
+    }
+
+    printf("Configuring Slot 1 to Module 0x%X...\n", MODULE_ID_CSP_ONLY);
+    ecrt_slave_config_sdo32(sc_hpm, 0xF030, 1, MODULE_ID_CSP_ONLY);
+
+    ecrt_slave_config_dc(sc_hpm, 0x0300, PERIOD_NS, 250000, 0, 0);
+
+    if (ecrt_slave_config_pdos(sc_hpm, EC_END, hpm_syncs)) {
+        fprintf(stderr, "Failed to configure PDOs!\n");
+        return -1;
+    }
+    
+    ecrt_slave_config_sdo8(sc_hpm, 0x6060, 0, 8);
+
+    if (ecrt_domain_reg_pdo_entry_list(domain1, domain1_regs)) {
+        fprintf(stderr, "PDO registration failed!\n");
+        return -1;
+    }
+
+    printf("Activating master...\n");
+    if (ecrt_master_activate(master)) return -1;
+    
+    if (!(domain1_pd = ecrt_domain_data(domain1))) return -1;
+
+    param.sched_priority = 49;
+    sched_setscheduler(0, SCHED_FIFO, &param);
+
+    clock_gettime(CLOCK_MONOTONIC, &wakeup_time);
+    wakeup_time.tv_sec += 1;
+
+    /* --- 步骤2: 循环条件改为检查 run 变量 --- */
+    while (run) {
+        wakeup_time.tv_nsec += PERIOD_NS;
+        while (wakeup_time.tv_nsec >= 1000000000) {
+            wakeup_time.tv_nsec -= 1000000000;
+            wakeup_time.tv_sec++;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wakeup_time, NULL);
+        cyclic_task(&wakeup_time);
+    }
+
+    /* --- 步骤3: 退出后的清理工作 (解决不用断电的关键) --- */
+    printf("\nStopping...\n");
+    
+    // 发送最后一次数据，将 Control Word 设为 0 (Disable)
+    EC_WRITE_U16(domain1_pd + offset.ctrl_word, 0x0000);
+    ecrt_domain_queue(domain1);
+    ecrt_master_send(master);
+    usleep(10000); // 等待一小会儿确保数据发出去
+
+    printf("Releasing Master...\n");
+    // 关键函数：注销主站，释放从站控制权，从站会回到 PREOP 状态
+    ecrt_master_deactivate(master); 
+    
+    printf("Done. Slave is reset and ready for next run.\n");
+    return 0;
+}
